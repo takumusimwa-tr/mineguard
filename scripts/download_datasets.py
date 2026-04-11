@@ -1,41 +1,17 @@
 """
 MineGuard — Dataset Downloader
-================================
-Downloads the three real industrial datasets used in this project.
+=======================================
+Downloads all three real industrial datasets.
 
 Usage
 -----
-    python scripts/download_datasets.py              # download all
+    python scripts/download_datasets.py              # all
     python scripts/download_datasets.py --dataset hydraulic
     python scripts/download_datasets.py --dataset cmapss
     python scripts/download_datasets.py --dataset bearing
-
-Datasets
---------
-1. UCI Hydraulic System Condition Monitoring
-   Source : https://archive.ics.uci.edu/dataset/447
-   Size   : ~7 MB (2205 cycles × 17 sensors at up to 100 Hz)
-   Target : cooler, valve, pump, accumulator health (4 targets)
-   Why    : hydraulic systems are the heart of every mine machine
-
-2. NASA CMAPSS Turbofan Degradation (FD001–FD004)
-   Source : https://data.nasa.gov/dataset/cmapss-jet-engine-simulated-data
-   Mirror : https://ti.arc.nasa.gov/tech/dash/groups/pcoe/prognostic-data-repository/
-   Size   : ~4 MB (4 sub-datasets, 26 columns, run-to-failure)
-   Target : Remaining Useful Life (RUL) in operating cycles
-   Why    : industry-standard RUL benchmark; maps to haul-truck engine life
-
-3. Case Western Reserve University Bearing Fault Dataset
-   Source : https://engineering.case.edu/bearingdatacenter/download-data-file
-   Mirror : Kaggle — https://www.kaggle.com/datasets/brjapon/gearbox-fault-diagnosis
-   Size   : ~70 MB (vibration signals at 12 kHz and 48 kHz)
-   Target : fault type (normal, inner race, outer race, ball) + severity
-   Why    : bearing failures are the #1 cause of unplanned downtime in mining
 """
 
 import argparse
-import hashlib
-import os
 import zipfile
 import io
 from pathlib import Path
@@ -43,7 +19,6 @@ from pathlib import Path
 import requests
 from tqdm import tqdm
 
-# ── Paths ─────────────────────────────────────────────────────────────────────
 ROOT       = Path(__file__).resolve().parents[1]
 RAW        = ROOT / "data" / "raw"
 HYD_DIR    = RAW / "hydraulic"
@@ -51,304 +26,281 @@ CMAPSS_DIR = RAW / "cmapss"
 BEAR_DIR   = RAW / "bearing"
 
 
-# ── Download helpers ──────────────────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _download(url: str, dest: Path, desc: str = "") -> Path:
-    """Stream-download url → dest with a progress bar."""
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    if dest.exists():
-        print(f"  [skip] {dest.name} already exists")
-        return dest
-
-    print(f"  Downloading {desc or dest.name} …")
-    resp = requests.get(url, stream=True, timeout=60)
+def _download_bytes(url: str, desc: str = "") -> bytes:
+    """Download URL → raw bytes with progress bar."""
+    print(f"  Downloading {desc} ...")
+    resp = requests.get(url, stream=True, timeout=120,
+                        headers={"User-Agent": "Mozilla/5.0"})
     resp.raise_for_status()
     total = int(resp.headers.get("content-length", 0))
-
-    with open(dest, "wb") as f, tqdm(
-        total=total, unit="B", unit_scale=True, unit_divisor=1024, leave=False
-    ) as bar:
+    buf = io.BytesIO()
+    with tqdm(total=total, unit="B", unit_scale=True, unit_divisor=1024, leave=False) as bar:
         for chunk in resp.iter_content(chunk_size=8192):
-            f.write(chunk)
+            buf.write(chunk)
             bar.update(len(chunk))
-
-    print(f"  Saved → {dest.relative_to(ROOT)}")
-    return dest
+    return buf.getvalue()
 
 
-def _unzip(zip_path: Path, out_dir: Path) -> None:
-    """Unzip archive into out_dir, skipping if already extracted."""
+def _save(path: Path, data: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(data)
+    print(f"  Saved  {path.relative_to(ROOT)}  ({len(data)/1e6:.1f} MB)")
+
+
+def _unzip_bytes(data: bytes, out_dir: Path) -> list[str]:
+    """Unzip bytes into out_dir, return list of extracted filenames."""
     out_dir.mkdir(parents=True, exist_ok=True)
-    with zipfile.ZipFile(zip_path, "r") as zf:
-        names = zf.namelist()
-        already = all((out_dir / n).exists() for n in names if not n.endswith("/"))
-        if already:
-            print(f"  [skip] {zip_path.name} already extracted")
-            return
-        print(f"  Extracting {zip_path.name} …")
-        zf.extractall(out_dir)
-        print(f"  Extracted {len(names)} files → {out_dir.relative_to(ROOT)}")
+    with zipfile.ZipFile(io.BytesIO(data)) as zf:
+        names = [n for n in zf.namelist() if not n.endswith("/")]
+        for name in names:
+            dest = out_dir / Path(name).name   # flatten — no sub-dirs
+            if dest.exists():
+                continue
+            dest.write_bytes(zf.read(name))
+        print(f"  Extracted {len(names)} files → {out_dir.relative_to(ROOT)}/")
+        return names
 
 
 # ── Dataset 1: UCI Hydraulic System ──────────────────────────────────────────
+#
+#  The dataset consists of 17 tab-delimited .txt files (one per sensor) plus
+#  a profile.txt with the condition labels.
+#  Official page : https://archive.ics.uci.edu/dataset/447
+#  The ucimlrepo client is the cleanest way — it uses the UCI REST API.
 
 def download_hydraulic():
-    """
-    UCI Hydraulic System Condition Monitoring dataset.
-
-    The ucimlrepo package is the cleanest way to fetch this —
-    it handles auth-free download and returns ready-to-use DataFrames.
-    Falls back to direct HTTP if the package isn't installed.
-    """
     print("\n[1/3] UCI Hydraulic System Condition Monitoring")
-    print("     Source: https://archive.uci.edu/dataset/447")
+    print("     https://archive.ics.uci.edu/dataset/447")
 
+    marker = HYD_DIR / "profile.txt"
+    if marker.exists():
+        print("  [skip] already downloaded")
+        return
+
+    # ── Method A: ucimlrepo Python client (preferred) ──
     try:
         from ucimlrepo import fetch_ucirepo
         import pandas as pd
 
-        marker = HYD_DIR / "profile.csv"
-        if marker.exists():
-            print("  [skip] dataset already downloaded")
-            return
-
-        print("  Fetching via ucimlrepo …")
+        print("  Fetching via ucimlrepo client ...")
         ds = fetch_ucirepo(id=447)
+        HYD_DIR.mkdir(parents=True, exist_ok=True)
 
-        # The dataset is structured as matrices per sensor
-        # X = sensor time-series features, y = condition labels
         X = ds.data.features
         y = ds.data.targets
-
-        HYD_DIR.mkdir(parents=True, exist_ok=True)
         X.to_csv(HYD_DIR / "sensor_features.csv", index=False)
         y.to_csv(HYD_DIR / "condition_labels.csv", index=False)
 
-        # Also save metadata
-        meta_lines = [
-            "# UCI Hydraulic System Condition Monitoring",
-            "# Dataset ID: 447",
-            "# URL: https://archive.uci.edu/dataset/447",
-            "#",
-            "# Targets (condition labels):",
-            "#   cooler_condition    : 3=near failure, 20=reduced, 100=full efficiency",
-            "#   valve_condition     : 100=optimal, 90=small lag, 80=severe, 73=failure",
-            "#   pump_leakage        : 0=none, 1=weak, 2=severe",
-            "#   accumulator_pressure: 130=optimal, 115=slight, 100=severe, 90=failure",
-            "#   stable_flag         : 1=stable conditions reached",
-            "#",
-            "# Sensor types (17 total):",
-            "#   PS1-PS6  : pressure sensors (bar), 100 Hz",
-            "#   EPS1     : motor power (W), 100 Hz",
-            "#   FS1-FS2  : volume flow (L/min), 10 Hz",
-            "#   TS1-TS4  : temperature (°C), 1 Hz",
-            "#   VS1      : vibration (mm/s), 1 Hz",
-            "#   CE, CP, SE: efficiency, cooling, efficiency, 1 Hz",
-        ]
-        (HYD_DIR / "README.md").write_text("\n".join(meta_lines))
-        print(f"  Saved sensor_features.csv ({len(X)} rows × {len(X.columns)} cols)")
-        print(f"  Saved condition_labels.csv ({len(y)} rows × {len(y.columns)} cols)")
+        print(f"  sensor_features.csv  ({len(X)} rows × {len(X.columns)} cols)")
+        print(f"  condition_labels.csv ({len(y)} rows × {len(y.columns)} cols)")
 
-    except ImportError:
-        print("  ucimlrepo not installed — install with: pip install ucimlrepo")
-        print("  Or download manually from: https://archive.uci.edu/dataset/447")
+        # Write a profile.txt marker so skip-check works next time
+        (HYD_DIR / "profile.txt").write_text("downloaded via ucimlrepo\n")
+        return
+
     except Exception as e:
-        print(f"  Download failed: {e}")
-        print("  Manual download: https://archive.uci.edu/dataset/447")
+        print(f"  ucimlrepo failed ({e}), trying direct HTTP ...")
+
+    # ── Method B: direct UCI zip download ──
+    # UCI exposes a zip at this endpoint
+    url = "https://archive.ics.uci.edu/static/public/447/condition+monitoring+of+hydraulic+systems.zip"
+    try:
+        data = _download_bytes(url, "hydraulic zip")
+        _unzip_bytes(data, HYD_DIR)
+        # The zip contains another nested zip — handle that
+        for nested in HYD_DIR.glob("*.zip"):
+            inner = _download_bytes.__doc__ and None  # just open it directly
+            with zipfile.ZipFile(nested) as zf:
+                zf.extractall(HYD_DIR)
+            nested.unlink()
+        (HYD_DIR / "profile.txt").write_text("downloaded via direct HTTP\n")
+        return
+    except Exception as e:
+        print(f"  Direct HTTP also failed: {e}")
+
+    # ── Fallback: manual instructions ──
+    print("""
+  MANUAL DOWNLOAD REQUIRED:
+  1. Go to https://archive.uci.edu/dataset/447
+  2. Click 'Download' → save the zip
+  3. Unzip into:  data/raw/hydraulic/
+  Expected files: PS1.txt PS2.txt ... TS1.txt ... profile.txt  (17 sensor files + labels)
+""")
 
 
 # ── Dataset 2: NASA CMAPSS ────────────────────────────────────────────────────
+#
+#  Four sub-datasets (FD001–FD004), each with train/test/RUL txt files.
+#  Official: https://data.nasa.gov/dataset/cmapss-jet-engine-simulated-data
+#  The NASA open data portal requires no login for this dataset.
 
-# Kaggle mirror — stable, no auth required for this specific dataset
-CMAPSS_KAGGLE_URL = (
-    "https://raw.githubusercontent.com/Samimust/predictive-maintenance/"
-    "master/CMAPSSData.zip"
-)
-
-# Column names per the CMAPSS paper
-CMAPSS_COLS = (
-    ["unit_id", "cycle"] +
-    [f"op_setting_{i}" for i in range(1, 4)] +
-    [f"sensor_{i:02d}" for i in range(1, 22)]
-)
-
+CMAPSS_URLS = [
+    # Kaggle public mirror (most reliable, no login for this one)
+    "https://raw.githubusercontent.com/deep-diver/NASA-Turbofan-Engine-RUL-Prediction/master/dataset/CMAPSSData.zip",
+    # Another public mirror
+    "https://raw.githubusercontent.com/TobiasRoeding/tuh-de-data/main/nasa/CMAPSSData.zip",
+]
 
 def download_cmapss():
-    """
-    NASA CMAPSS Turbofan Degradation dataset (FD001–FD004).
-
-    Tries a public GitHub mirror first. If that fails, prints
-    instructions for the official NASA download.
-    """
-    print("\n[2/3] NASA CMAPSS Turbofan Degradation")
-    print("     Source: https://data.nasa.gov/dataset/cmapss-jet-engine-simulated-data")
+    print("\n[2/3] NASA CMAPSS Turbofan Degradation (FD001–FD004)")
+    print("     https://data.nasa.gov/dataset/cmapss-jet-engine-simulated-data")
 
     marker = CMAPSS_DIR / "train_FD001.txt"
     if marker.exists():
-        print("  [skip] dataset already downloaded")
+        print("  [skip] already downloaded")
         return
 
     CMAPSS_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Try GitHub mirror
-    mirrors = [
-        "https://raw.githubusercontent.com/Samimust/predictive-maintenance/master/CMAPSSData.zip",
-        "https://github.com/schwxd/LSTM-Keras-CMAPSS/raw/master/C-MAPSS-Data.zip",
-    ]
-
-    zip_path = CMAPSS_DIR / "CMAPSSData.zip"
-    downloaded = False
-
-    for url in mirrors:
+    for url in CMAPSS_URLS:
         try:
-            _download(url, zip_path, "CMAPSS zip")
-            downloaded = True
-            break
+            data = _download_bytes(url, f"CMAPSS zip ({url.split('/')[2]})")
+            extracted = _unzip_bytes(data, CMAPSS_DIR)
+            if any("FD001" in n for n in extracted):
+                print("  Successfully downloaded CMAPSS dataset.")
+                return
         except Exception as e:
-            print(f"  Mirror {url[:60]}… failed: {e}")
+            print(f"  Mirror failed: {e}")
 
-    if downloaded and zip_path.exists():
-        _unzip(zip_path, CMAPSS_DIR)
-        zip_path.unlink()  # remove zip to save space
-    else:
-        print("\n  Auto-download failed. Manual steps:")
-        print("  1. Go to https://data.nasa.gov/dataset/cmapss-jet-engine-simulated-data")
-        print("  2. Download CMAPSSData.zip")
-        print(f"  3. Unzip into: {CMAPSS_DIR.relative_to(ROOT)}/")
-        print("     You should have: train_FD001.txt, test_FD001.txt, RUL_FD001.txt (×4)")
+    # Fallback
+    print("""
+  MANUAL DOWNLOAD REQUIRED:
+  Option A (easiest — Kaggle, free account needed):
+    1. Go to https://www.kaggle.com/datasets/behrad3d/nasa-cmaps
+    2. Download the zip
+    3. Unzip into:  data/raw/cmapss/
+    Expected: train_FD001.txt  test_FD001.txt  RUL_FD001.txt  (× 4 sub-datasets)
 
-    # Write README regardless
-    readme = [
-        "# NASA CMAPSS Turbofan Degradation Dataset",
-        "# Source: https://data.nasa.gov/dataset/cmapss-jet-engine-simulated-data",
-        "#",
-        "# Files: train_FD00{1-4}.txt, test_FD00{1-4}.txt, RUL_FD00{1-4}.txt",
-        "#",
-        "# Column layout (26 columns, space-separated, no header):",
-        "#   1  unit_id",
-        "#   2  cycle (operating cycle number)",
-        "#   3-5  op_setting_1, op_setting_2, op_setting_3",
-        "#   6-26 sensor_01 … sensor_21",
-        "#",
-        "# Sub-datasets:",
-        "#   FD001: 1 fault mode (HPC degradation), 1 operating condition",
-        "#   FD002: 1 fault mode, 6 operating conditions",
-        "#   FD003: 2 fault modes, 1 operating condition",
-        "#   FD004: 2 fault modes, 6 operating conditions",
-        "#",
-        "# Task: predict Remaining Useful Life (RUL) for each engine in test set",
-        "# True RUL values provided in RUL_FD00{1-4}.txt",
-    ]
-    (CMAPSS_DIR / "README.md").write_text("\n".join(readme))
+  Option B (NASA official):
+    1. Go to https://data.nasa.gov/dataset/cmapss-jet-engine-simulated-data
+    2. Download CMAPSSData.zip
+    3. Unzip into:  data/raw/cmapss/
+""")
 
 
-# ── Dataset 3: CWRU Bearing ────────────────────────────────────────────────────
+# ── Dataset 3: CWRU Bearing Fault ─────────────────────────────────────────────
+#
+#  .mat files (MATLAB format) — loaded with scipy.io.loadmat().
+#  Each file contains drive-end vibration signals at 12 kHz.
+#  We grab a representative subset: normal + 3 fault types × 3 loads.
 
 CWRU_FILES = {
-    # Normal baseline (1797 RPM, drive end)
-    "normal_0hp.mat": "https://engineering.case.edu/sites/default/files/Normal_0.mat",
-    # Inner race faults (drive end, 0.007 inch fault)
-    "ir007_0hp.mat":  "https://engineering.case.edu/sites/default/files/IR007_0.mat",
-    "ir007_1hp.mat":  "https://engineering.case.edu/sites/default/files/IR007_1.mat",
-    "ir007_2hp.mat":  "https://engineering.case.edu/sites/default/files/IR007_2.mat",
-    # Ball faults (drive end, 0.007 inch)
-    "b007_0hp.mat":   "https://engineering.case.edu/sites/default/files/B007_0.mat",
-    "b007_1hp.mat":   "https://engineering.case.edu/sites/default/files/B007_1.mat",
-    # Outer race faults (drive end, 0.007 inch)
-    "or007_0hp.mat":  "https://engineering.case.edu/sites/default/files/OR007@6_0.mat",
-    "or007_1hp.mat":  "https://engineering.case.edu/sites/default/files/OR007@6_1.mat",
+    # filename in data/raw/bearing/ : direct download URL
+    "normal_0.mat":  "https://engineering.case.edu/sites/default/files/Normal_0.mat",
+    "normal_1.mat":  "https://engineering.case.edu/sites/default/files/Normal_1.mat",
+    "IR007_0.mat":   "https://engineering.case.edu/sites/default/files/IR007_0.mat",
+    "IR007_1.mat":   "https://engineering.case.edu/sites/default/files/IR007_1.mat",
+    "IR007_2.mat":   "https://engineering.case.edu/sites/default/files/IR007_2.mat",
+    "B007_0.mat":    "https://engineering.case.edu/sites/default/files/B007_0.mat",
+    "B007_1.mat":    "https://engineering.case.edu/sites/default/files/B007_1.mat",
+    "OR007_0.mat":   "https://engineering.case.edu/sites/default/files/OR007@6_0.mat",
+    "OR007_1.mat":   "https://engineering.case.edu/sites/default/files/OR007@6_1.mat",
+    "IR014_0.mat":   "https://engineering.case.edu/sites/default/files/IR014_0.mat",
+    "IR021_0.mat":   "https://engineering.case.edu/sites/default/files/IR021_0.mat",
+    "B014_0.mat":    "https://engineering.case.edu/sites/default/files/B014_0.mat",
+    "OR021_0.mat":   "https://engineering.case.edu/sites/default/files/OR021@6_0.mat",
 }
 
-CWRU_KAGGLE_NOTE = """
-  Note: CWRU direct server is sometimes slow or rate-limited.
-  Reliable alternative — Kaggle dataset (requires free Kaggle account):
-    https://www.kaggle.com/datasets/brjapon/gearbox-fault-diagnosis
-
-  To download via Kaggle CLI:
-    pip install kaggle
-    kaggle datasets download brjapon/gearbox-fault-diagnosis
-    unzip gearbox-fault-diagnosis.zip -d data/raw/bearing/
-"""
+# Kaggle mirror for bearing data — much more reliable than CWRU server
+CWRU_KAGGLE_URL = "https://www.kaggle.com/api/v1/datasets/download/brjapon/gearbox-fault-diagnosis"
 
 
 def download_bearing():
-    """
-    Case Western Reserve University Bearing Fault dataset.
-
-    Tries direct download from CWRU server.
-    Falls back to instructions for Kaggle mirror.
-    """
     print("\n[3/3] CWRU Bearing Fault Dataset")
-    print("     Source: https://engineering.case.edu/bearingdatacenter")
+    print("     https://engineering.case.edu/bearingdatacenter")
 
     BEAR_DIR.mkdir(parents=True, exist_ok=True)
 
-    any_success = False
+    existing = list(BEAR_DIR.glob("*.mat"))
+    if len(existing) >= 5:
+        print(f"  [skip] {len(existing)} .mat files already present")
+        return
+
+    # ── Method A: direct file downloads from CWRU ──
+    succeeded = 0
+    failed    = []
     for fname, url in CWRU_FILES.items():
         dest = BEAR_DIR / fname
         if dest.exists():
-            print(f"  [skip] {fname}")
-            any_success = True
+            succeeded += 1
             continue
         try:
-            _download(url, dest, fname)
-            any_success = True
+            data = _download_bytes(url, fname)
+            _save(dest, data)
+            succeeded += 1
         except Exception as e:
-            print(f"  Failed {fname}: {e}")
+            failed.append(fname)
 
-    if not any_success:
-        print(CWRU_KAGGLE_NOTE)
+    if succeeded >= 5:
+        print(f"  Downloaded {succeeded}/{len(CWRU_FILES)} files from CWRU server.")
+        if failed:
+            print(f"  {len(failed)} files failed (not critical): {failed}")
+        return
 
-    # README
-    readme = [
-        "# CWRU Bearing Fault Dataset",
-        "# Source: https://engineering.case.edu/bearingdatacenter",
-        "#",
-        "# .mat files — load with scipy.io.loadmat()",
-        "# Key arrays inside each file:",
-        "#   DE_time : drive end accelerometer (12 kHz or 48 kHz)",
-        "#   FE_time : fan end accelerometer",
-        "#   BA_time : base accelerometer (some files)",
-        "#   RPM     : shaft speed",
-        "#",
-        "# Fault types:",
-        "#   normal  : healthy baseline",
-        "#   IR      : inner race fault",
-        "#   B       : ball fault",
-        "#   OR      : outer race fault",
-        "#",
-        "# Fault sizes: 0.007, 0.014, 0.021, 0.028 inch diameter",
-        "# Loads: 0, 1, 2, 3 HP (motor load)",
-        "#",
-        "# Kaggle mirror (easier download):",
-        "#   https://www.kaggle.com/datasets/brjapon/gearbox-fault-diagnosis",
-    ]
-    (BEAR_DIR / "README.md").write_text("\n".join(readme))
+    # ── Method B: Kaggle CLI ──
+    print(f"\n  CWRU server unreliable ({succeeded} files). Trying Kaggle CLI ...")
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["kaggle", "datasets", "download", "brjapon/gearbox-fault-diagnosis",
+             "--path", str(BEAR_DIR), "--unzip"],
+            capture_output=True, text=True, timeout=300
+        )
+        if result.returncode == 0:
+            mat_files = list(BEAR_DIR.rglob("*.mat"))
+            print(f"  Kaggle download succeeded — {len(mat_files)} .mat files")
+            return
+        else:
+            print(f"  Kaggle CLI error: {result.stderr.strip()}")
+    except FileNotFoundError:
+        print("  Kaggle CLI not installed.")
+    except Exception as e:
+        print(f"  Kaggle CLI failed: {e}")
+
+    # ── Fallback: manual instructions ──
+    print("""
+  MANUAL DOWNLOAD (pick one):
+
+  Option A — Kaggle (free account, easiest):
+    1. Sign up at https://kaggle.com (free)
+    2. Go to https://www.kaggle.com/datasets/brjapon/gearbox-fault-diagnosis
+    3. Click Download → unzip into:  data/raw/bearing/
+    Expected: lots of .mat files (normal, IR, OR, B fault types)
+
+  Option B — Direct from CWRU:
+    1. Go to https://engineering.case.edu/bearingdatacenter/download-data-file
+    2. Download files from the "12k Drive End Bearing Fault Data" section
+    3. Save .mat files into:  data/raw/bearing/
+
+  Option C — Install Kaggle CLI then re-run:
+    pip install kaggle
+    # Put your kaggle.json in C:\\Users\\<you>\\.kaggle\\
+    python scripts/download_datasets.py --dataset bearing
+""")
 
 
-# ── Dataset summary printout ───────────────────────────────────────────────────
+# ── Summary ───────────────────────────────────────────────────────────────────
 
 def print_summary():
     print("\n" + "=" * 58)
     print("Dataset download summary")
     print("=" * 58)
-    datasets = {
-        "Hydraulic (UCI)": HYD_DIR,
-        "CMAPSS (NASA)":   CMAPSS_DIR,
-        "Bearing (CWRU)":  BEAR_DIR,
-    }
-    for name, path in datasets.items():
+
+    def _status(path, extensions):
         if not path.exists():
-            status = "NOT DOWNLOADED"
-        else:
-            files = list(path.rglob("*"))
-            data_files = [f for f in files if f.is_file() and f.suffix != ".md"]
-            if not data_files:
-                status = "EMPTY"
-            else:
-                total_mb = sum(f.stat().st_size for f in data_files) / 1e6
-                status = f"{len(data_files)} files  ({total_mb:.1f} MB)"
-        print(f"  {name:<22} {status}")
+            return "NOT DOWNLOADED"
+        files = [f for f in path.rglob("*")
+                 if f.is_file() and f.suffix in extensions]
+        if not files:
+            return "EMPTY (README only)"
+        mb = sum(f.stat().st_size for f in files) / 1e6
+        return f"{len(files)} files  ({mb:.1f} MB)"
+
+    print(f"  Hydraulic (UCI)   {_status(HYD_DIR,  {'.csv','.txt'})}")
+    print(f"  CMAPSS (NASA)     {_status(CMAPSS_DIR,{'.txt'})}")
+    print(f"  Bearing (CWRU)    {_status(BEAR_DIR,  {'.mat', '.csv'})}")
     print()
 
 
@@ -356,12 +308,9 @@ def print_summary():
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Download MineGuard datasets")
-    parser.add_argument(
-        "--dataset",
-        choices=["hydraulic", "cmapss", "bearing", "all"],
-        default="all",
-        help="Which dataset to download (default: all)",
-    )
+    parser.add_argument("--dataset",
+                        choices=["hydraulic", "cmapss", "bearing", "all"],
+                        default="all")
     args = parser.parse_args()
 
     print("\nMineGuard Dataset Downloader")
