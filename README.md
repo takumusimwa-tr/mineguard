@@ -4,6 +4,8 @@
 > predicts failures before they happen, and estimates remaining useful life —
 > built on real sensor datasets from hydraulic systems, turbofan engines, and bearings.
 
+**Live demo:** https://huggingface.co/spaces/trent1808/mineguard
+
 ---
 
 ## Why this project exists
@@ -26,8 +28,9 @@ live dashboard.
 | Cooler condition | UCI Hydraulic | Gradient Boosting | F1 = **0.9935** | 3 |
 | Accumulator health | UCI Hydraulic | Gradient Boosting | F1 = **0.9262** | 4 |
 | Pump leakage | UCI Hydraulic | Random Forest + SMOTE | F1 = **1.000** | 3 |
-| RUL prediction | NASA CMAPSS FD001 | LSTM (2-layer, 128 hidden) | RMSE = **14.74 cycles** | — |
-| Bearing fault | SEU Gearbox vibration | Random Forest | F1 = **1.000** | 2 |
+| RUL v1 (FD001) | NASA CMAPSS | LSTM 2-layer | RMSE = **14.74 cycles** | — |
+| RUL v2 (FD003) | NASA CMAPSS | LSTM 3-layer (all FDs) | RMSE = **23.51 cycles** | — |
+| Bearing fault | SEU Gearbox | Random Forest | F1 = **1.000** | 2 |
 
 ---
 
@@ -36,7 +39,7 @@ live dashboard.
 ```
 Data sources
   ├── UCI Hydraulic System (real)        → Failure Classifier  (Gradient Boosting)
-  ├── NASA CMAPSS FD001–FD004 (real)     → RUL Predictor       (LSTM 2-layer)
+  ├── NASA CMAPSS FD001–FD004 (real)     → RUL Predictor       (LSTM v1 + v2)
   ├── SEU Gearbox Vibration (real)       → Fault Classifier    (Random Forest)
   └── MineGuard Simulator (synthetic)    → Live dashboard stream
 
@@ -48,7 +51,7 @@ Data sources
         SQLite log    Streamlit     MLflow
         (history)    Dashboard    (experiments)
                           ↓
-                Docker + GitHub Actions
+                Docker + GitHub Actions CI/CD
 ```
 
 ---
@@ -73,22 +76,22 @@ mineguard/
 │   │   ├── hydraulic/          ← UCI hydraulic dataset (556 MB, 17 sensors)
 │   │   ├── cmapss/             ← NASA CMAPSS FD001–FD004 (45 MB)
 │   │   └── bearing/            ← SEU gearbox vibration CSVs (70 MB)
-│   ├── processed/              ← Feature-engineered DataFrames + figures
-│   └── simulated/              ← Output of sensor_generator.py
+│   ├── processed/              ← Feature-engineered DataFrames + 19 figures
+│   └── simulated/              ← Output of sensor_generator.py (~650K rows)
 │
 ├── simulator/
 │   └── sensor_generator.py     ← Physics-based 3-phase degradation simulator
 │
 ├── models/
 │   ├── failure_classifier/     ← cooler/accumulator/pump .pkl + imputer + metadata
-│   ├── rul_predictor/          ← lstm_rul.pt + scaler.pkl + metadata
+│   ├── rul_predictor/          ← lstm_rul.pt + lstm_rul_v2.pt + scalers + metadata
 │   └── anomaly_detector/       ← bearing_classifier.pkl + metadata
 │
 ├── api/
-│   └── main.py                 ← FastAPI: /predict /rul /fault /stream /health
+│   └── main.py                 ← FastAPI: /predict /rul /fault /stream /health /history
 │
 ├── dashboard/
-│   └── app.py                  ← Streamlit digital twin dashboard
+│   └── app.py                  ← Streamlit digital twin dashboard (5 tabs)
 │
 ├── mlops/
 │   ├── Dockerfile
@@ -97,13 +100,18 @@ mineguard/
 ├── notebooks/
 │   ├── 01_hydraulic_eda.ipynb          ← EDA: 17 sensors, 136 features
 │   ├── 02_hydraulic_classifier.ipynb   ← Failure classifier: F1 0.926–1.000
-│   ├── 03_cmapss_rul.ipynb             ← LSTM RUL: RMSE=14.74 cycles
-│   └── 04_bearing_fault.ipynb          ← Fault classifier: F1=1.000
+│   ├── 03_cmapss_rul.ipynb             ← LSTM v1: RMSE=14.74 (FD001)
+│   ├── 04_bearing_fault.ipynb          ← Fault classifier: F1=1.000
+│   └── 05_improved_rul.ipynb           ← LSTM v2: all 4 FDs, FD003 RMSE 49→23
+│
+├── scripts/
+│   ├── download_datasets.py    ← Automated dataset downloader
+│   └── log_experiments.py      ← MLflow experiment logger
 │
 ├── tests/
-├── scripts/
-│   └── download_datasets.py    ← Automated dataset downloader
+│   └── test_mineguard.py       ← pytest suite (5 tests)
 │
+├── .github/workflows/ci.yml    ← GitHub Actions CI/CD
 ├── Makefile
 ├── requirements.txt
 └── README.md
@@ -144,9 +152,10 @@ units (haul trucks, drill rigs, LHDs) with five failure modes.
 
 ```
 notebooks/01_hydraulic_eda.ipynb          → EDA and feature extraction
-notebooks/02_hydraulic_classifier.ipynb   → Train and evaluate failure classifiers
-notebooks/03_cmapss_rul.ipynb             → Train LSTM RUL predictor
+notebooks/02_hydraulic_classifier.ipynb   → Train failure classifiers
+notebooks/03_cmapss_rul.ipynb             → Train LSTM v1 RUL predictor
 notebooks/04_bearing_fault.ipynb          → Train bearing fault classifier
+notebooks/05_improved_rul.ipynb           → Train LSTM v2 (all 4 FDs)
 ```
 
 ### 5. Run the full stack
@@ -158,8 +167,17 @@ uvicorn api.main:app --reload --port 8000
 # Dashboard (separate terminal)
 streamlit run dashboard/app.py --server.port 8501
 
-# MLflow experiment tracking (optional)
-mlflow ui --port 5000
+# MLflow experiment tracking (separate terminal)
+mlflow server --host 0.0.0.0 --port 5000 --backend-store-uri sqlite:///mlflow/mlflow.db --default-artifact-root ./mlflow/artifacts
+
+# Log all experiments to MLflow
+python scripts/log_experiments.py
+```
+
+Or spin everything up with Docker:
+
+```powershell
+docker-compose up --build
 ```
 
 ---
@@ -169,44 +187,58 @@ mlflow ui --port 5000
 ### Failure Classifier — hydraulic component health
 - **Dataset:** UCI Hydraulic System Condition Monitoring (2205 cycles, 17 sensors)
 - **Features:** 136 statistical features (8 stats × 17 sensors per cycle)
-- **Targets:** Cooler condition (3 classes), accumulator pressure (4 classes), pump leakage (3 classes)
-- **Architecture:** Gradient Boosting (cooler, accumulator) + Random Forest with SMOTE (pump)
+- **Targets:** Cooler (3 classes), accumulator pressure (4 classes), pump leakage (3 classes)
+- **Architecture:** Gradient Boosting (cooler, accumulator) + Random Forest + SMOTE (pump)
 - **Results:** Cooler F1=0.9935 | Accumulator F1=0.9262 | Pump F1=1.000
 
-### RUL Predictor — remaining useful life
+### RUL Predictor v1 — single fault mode
 - **Dataset:** NASA CMAPSS FD001 (100 engines, run-to-failure)
-- **Input:** Sliding window of 14 sensor readings over last 30 cycles
-- **Output:** Estimated cycles until failure (regression), RUL capped at 125
-- **Architecture:** 2-layer LSTM (128 hidden units) + MLP head, trained with early stopping
-- **Results:** FD001 Test RMSE=14.74 cycles | NASA Score=367.65
-- **Note:** FD003 generalization RMSE=49.12 — model is fault-mode specific (documented as future work)
+- **Input:** 14 sensors × 30-cycle sliding window
+- **Architecture:** 2-layer LSTM (128 hidden) + MLP head
+- **Results:** FD001 RMSE=14.74 | NASA Score=367.65
+
+### RUL Predictor v2 — all fault modes (improved)
+- **Dataset:** NASA CMAPSS FD001+FD002+FD003+FD004 combined
+- **Input:** 15 sensors × 30-cycle window, per-cluster MinMaxScaler (KMeans k=6)
+- **Architecture:** 3-layer LSTM (256 hidden) + deeper MLP head
+- **Results:** FD001 RMSE=21.87 | FD003 RMSE=23.51 (49% improvement over v1) | FD002=30.76 | FD004=29.97
 
 ### Fault Classifier — gearbox bearing health
 - **Dataset:** SEU gearbox vibration, 88,320 samples × 4 channels per file
-- **Input:** 64 features per 512-sample window (9 time-domain + 7 frequency-domain per channel)
-- **Output:** Healthy vs ball fault classification
+- **Input:** 64 features per 512-sample window (time-domain + FFT, 4 channels)
 - **Architecture:** Random Forest (300 trees) with StandardScaler pipeline
-- **Results:** Test F1=1.000 | Accuracy=1.000 | Perfect generalization across unseen load levels (70%, 80%, 90%)
+- **Results:** F1=1.000 | Accuracy=1.000 | Perfect generalization at 70%, 80%, 90% load
 
 ---
 
 ## Key engineering insights
 
-**Hydraulic classifier:** CE (cooling efficiency) sensor features dominate — CE_min, CE_rms,
-CE_mean, and CE_max are the top 4 features by significant margin. Cooler degradation manifests
-first in cooling efficiency before propagating to downstream pressure (PS5, PS6) and temperature
-(TS4) sensors. The stable-flag filter removed 1,449 of 2,205 cycles (66%) — training only on
-the 756 stable cycles produced cleaner decision boundaries and higher F1 scores.
+**Hydraulic classifier:** CE (cooling efficiency) features dominate — CE_min, CE_rms, CE_mean,
+and CE_max are the top 4 features. Cooler degradation manifests first in cooling efficiency
+before propagating downstream. The stable-flag filter removed 1,449 of 2,205 cycles (66%) —
+training only on 756 stable cycles produced significantly cleaner decision boundaries.
 
-**RUL predictor:** Validation RMSE dropped from 83.7 → 12.6 across 60 epochs with a clean
-convergence curve. The error distribution is centred near zero with slight overestimation bias
-at low RUL values — the more dangerous direction for maintenance scheduling. FD003
-generalization failure (RMSE=49.12) is documented honestly: a single-fault-mode model cannot
-reliably predict degradation from an unseen second fault mode without retraining.
+**RUL v1 → v2:** Training on all four CMAPSS sub-datasets fixed the FD003 generalization failure
+(RMSE 49.12 → 23.51). The multi-task tradeoff is expected — FD001 RMSE rose from 14.74 to 21.87,
+but a model that works across fault modes is more valuable for real mining deployment than one
+optimised for a single scenario.
 
-**Bearing fault classifier:** Kurtosis and crest factor features dominate the importance ranking —
-the industry-standard bearing fault indicators. The model achieves perfect F1=1.0 on unseen
-load conditions (70–90%), confirming it learned fault physics rather than load-level artifacts.
+**Bearing fault classifier:** Kurtosis and crest factor features dominate — the industry-standard
+bearing fault indicators used in real condition monitoring. F1=1.0 on unseen load conditions
+(70–90%) confirms the model learned fault physics, not load-level artifacts.
+
+---
+
+## MLflow experiment tracking
+
+All five model runs are logged with full parameter, metric, and artifact tracking:
+
+```powershell
+mlflow server --host 0.0.0.0 --port 5000 --backend-store-uri sqlite:///mlflow/mlflow.db --default-artifact-root ./mlflow/artifacts
+python scripts/log_experiments.py
+```
+
+Navigate to **http://localhost:5000** → Model training to compare runs side by side.
 
 ---
 
@@ -215,11 +247,12 @@ load conditions (70–90%), confirming it learned fault physics rather than load
 | Layer | Technology |
 |---|---|
 | Data | pandas, numpy, scipy, ucimlrepo |
-| Models | scikit-learn, imbalanced-learn, PyTorch |
+| Models | scikit-learn, imbalanced-learn, PyTorch 2.6 (CUDA 12.4) |
 | API | FastAPI, Pydantic, Uvicorn |
 | Dashboard | Streamlit, Plotly |
-| MLOps | MLflow, Docker, GitHub Actions |
-| Testing | pytest, httpx |
+| MLOps | MLflow 3.11, Docker, GitHub Actions |
+| Testing | pytest |
+| Deployment | Hugging Face Spaces |
 
 ---
 
