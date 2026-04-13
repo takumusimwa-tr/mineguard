@@ -1,0 +1,42 @@
+{
+  "feature_cols": [
+    "s_02",
+    "s_03",
+    "s_04",
+    "s_06",
+    "s_07",
+    "s_08",
+    "s_09",
+    "s_11",
+    "s_12",
+    "s_13",
+    "s_14",
+    "s_15",
+    "s_17",
+    "s_20",
+    "s_21"
+  ],
+  "window_size": 30,
+  "rul_cap": 125,
+  "trained_on": "FD001+FD002+FD003+FD004",
+  "version": "v2",
+  "n_op_clusters": 6,
+  "performance": {
+    "FD001": {
+      "rmse": 21.8657,
+      "nasa_score": 1560.25
+    },
+    "FD002": {
+      "rmse": 30.7612,
+      "nasa_score": 27082.33
+    },
+    "FD003": {
+      "rmse": 23.513,
+      "nasa_score": 2896.5
+    },
+    "FD004": {
+      "rmse": 29.9662,
+      "nasa_score": 8474.91
+    }
+  }
+}
