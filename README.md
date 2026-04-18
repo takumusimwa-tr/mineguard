@@ -1,7 +1,7 @@
 # MineGuard — AI-Powered Predictive Maintenance for Mining Equipment
 
 > An end-to-end industrial ML system that monitors heavy mining equipment in real time,
-> predicts failures before they happen, and estimates remaining useful life —
+> predicts failures before they happen, and estimates remaining useful life
 > built on real sensor datasets from hydraulic systems, turbofan engines, and bearings.
 
 **Live demo:** https://huggingface.co/spaces/trent1808/mineguard
