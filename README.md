@@ -12,7 +12,7 @@
 
 Unplanned equipment failure in underground mining costs upwards of **$50,000/hour** in lost
 production. This project builds a production-grade predictive maintenance platform for a
-fleet of haul trucks, hydraulic drill rigs, and LHD loaders — the exact equipment I worked
+fleet of haul trucks, hydraulic drill rigs, and LHD loaders, the exact equipment I worked
 with as a Mining Engineer and Radiation Technician at Wireline Africa (Mozambique, 2023–2025).
 
 The system combines three real industrial datasets with a physics-based sensor simulator
