@@ -4,7 +4,7 @@ MineGuard — FastAPI Backend
 Serves three trained models via a REST API:
 
   POST /predict   — hydraulic component health (cooler, accumulator, pump)
-  POST /rul       — remaining useful life prediction (LSTM)
+  POST /rul       — remaining useful life prediction (LSTM v2)
   POST /fault     — bearing fault classification
   GET  /health    — API health check + model status
   GET  /models    — model metadata and performance benchmarks
@@ -46,8 +46,9 @@ DB_PATH   = ROOT / "logs" / "predictions.db"
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 
-# ── LSTM architecture (must match training exactly) ───────────────────────────
+# ── LSTM v1 architecture (kept for reference) ─────────────────────────────────
 class LSTMPredictor(nn.Module):
+    """2-layer LSTM — matches lstm_rul.pt (v1, FD001 only)"""
     def __init__(self, input_size, hidden_size=128, num_layers=2, dropout=0.2):
         super().__init__()
         self.lstm = nn.LSTM(
@@ -58,6 +59,30 @@ class LSTMPredictor(nn.Module):
             nn.Linear(hidden_size, 64),
             nn.ReLU(),
             nn.Dropout(dropout),
+            nn.Linear(64, 1)
+        )
+
+    def forward(self, x):
+        out, _ = self.lstm(x)
+        return self.head(out[:, -1, :])
+
+
+# ── LSTM v2 architecture (production model) ───────────────────────────────────
+class LSTMPredictorV2(nn.Module):
+    """3-layer LSTM with deeper MLP head — matches lstm_rul_v2.pt (all 4 FDs)"""
+    def __init__(self, input_size, hidden_size=256, num_layers=3, dropout=0.3):
+        super().__init__()
+        self.lstm = nn.LSTM(
+            input_size, hidden_size, num_layers,
+            batch_first=True, dropout=dropout
+        )
+        self.head = nn.Sequential(
+            nn.Linear(hidden_size, 128),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Dropout(0.1),
             nn.Linear(64, 1)
         )
 
@@ -82,8 +107,8 @@ class ModelRegistry:
         self.fc_pump         = joblib.load(FC_DIR / "pump_classifier.pkl")
         self.fc_targets      = self.fc_meta["targets"]
 
-        # ── RUL predictor ──────────────────────────────────────────────────
-        with open(RUL_DIR / "metadata.json") as f:
+        # ── RUL predictor v2 (all 4 CMAPSS sub-datasets) ──────────────────
+        with open(RUL_DIR / "metadata_v2.json") as f:
             self.rul_meta = json.load(f)
 
         self.rul_feature_cols = self.rul_meta["feature_cols"]
@@ -92,12 +117,12 @@ class ModelRegistry:
         self.rul_scaler       = joblib.load(RUL_DIR / "scaler.pkl")
 
         ckpt = torch.load(
-            RUL_DIR / "lstm_rul.pt",
+            RUL_DIR / "lstm_rul_v2.pt",
             map_location=self.device,
             weights_only=False
         )
         cfg = ckpt["model_config"]
-        self.rul_model = LSTMPredictor(**cfg).to(self.device)
+        self.rul_model = LSTMPredictorV2(**cfg).to(self.device)
         self.rul_model.load_state_dict(ckpt["model_state_dict"])
         self.rul_model.eval()
 
@@ -112,8 +137,8 @@ class ModelRegistry:
 
         print(f"Models loaded — device: {self.device}")
         print(f"  Failure classifier : {len(self.fc_feature_cols)} features")
-        print(f"  RUL predictor      : window={self.rul_window}, "
-              f"{len(self.rul_feature_cols)} sensors")
+        print(f"  RUL predictor v2   : window={self.rul_window}, "
+              f"{len(self.rul_feature_cols)} sensors, all 4 CMAPSS FDs")
         print(f"  Bearing classifier : window={self.ad_window}, "
               f"{len(self.ad_channels)} channels")
 
@@ -158,7 +183,6 @@ def log_prediction(endpoint: str, result: dict, latency_ms: float,
 # ── Alert logic ───────────────────────────────────────────────────────────────
 def hydraulic_alert(pred: int, n_classes: int) -> str:
     """
-    Generic alert for hydraulic components.
     Last class = healthy/optimal = NORMAL.
     First class = worst = CRITICAL.
     Middle classes = WARNING.
@@ -184,11 +208,11 @@ def extract_bearing_features(window: np.ndarray) -> np.ndarray:
         peak = np.max(np.abs(s))
         feats.extend([
             s.mean(), s.std(), rms, peak,
-            peak / (rms + 1e-10),           # crest factor
+            peak / (rms + 1e-10),
             stats.kurtosis(s),
             stats.skew(s),
-            np.mean(np.abs(s)),             # mean absolute value
-            np.mean(np.abs(s)) / (rms + 1e-10),  # shape factor
+            np.mean(np.abs(s)),
+            np.mean(np.abs(s)) / (rms + 1e-10),
         ])
         N    = len(s)
         yf   = np.abs(fft(s))[:N // 2]
@@ -216,9 +240,10 @@ app = FastAPI(
     title="MineGuard API",
     description=(
         "Predictive maintenance API for heavy mining equipment. "
-        "Hydraulic failure classification, RUL prediction, and bearing fault detection."
+        "Hydraulic failure classification, RUL prediction (LSTM v2, all 4 CMAPSS FDs), "
+        "and bearing fault detection."
     ),
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -296,9 +321,10 @@ def health():
         "status"    : "ok",
         "timestamp" : datetime.now(timezone.utc).isoformat(),
         "device"    : str(registry.device),
+        "version"   : "1.1.0",
         "models"    : {
             "failure_classifier": "loaded",
-            "rul_predictor"     : "loaded",
+            "rul_predictor"     : "loaded (v2 — all 4 CMAPSS FDs)",
             "bearing_classifier": "loaded",
         },
     }
@@ -332,8 +358,7 @@ def predict_hydraulic(body: HydraulicInput):
     if registry is None:
         raise HTTPException(503, "Models not loaded")
 
-    t0 = time.perf_counter()
-
+    t0      = time.perf_counter()
     fc      = registry.fc_feature_cols
     missing = [c for c in fc if c not in body.features]
     if missing:
@@ -373,7 +398,8 @@ def predict_rul(body: RULInput):
     """
     Predict Remaining Useful Life in cycles from the last 30 sensor readings.
 
-    Trained on NASA CMAPSS FD001 (single fault mode).
+    Served by LSTM v2 trained on all 4 CMAPSS sub-datasets.
+    Handles multiple fault modes and 6 operating conditions.
     Alert thresholds: CRITICAL < 20 cycles, WARNING < 50 cycles.
     """
     if registry is None:
@@ -453,9 +479,6 @@ def stream_reading(
 ):
     """
     Generate a simulated sensor reading from the MineGuard physics simulator.
-
-    Returns a live-style sensor record. Useful for dashboard demos
-    and integration testing without needing real equipment data.
 
     equipment_type : HT (haul truck) | DR (drill rig) | LHD (loader)
     failure_mode   : overheating | bearing_wear | hydraulic_leak |
